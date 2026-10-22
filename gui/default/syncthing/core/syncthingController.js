@@ -546,7 +546,13 @@ angular.module('syncthing.core')
                         $scope.model[folder] = data;
                         recalcLocalStateTotal();
                         console.log("refreshFolder", folder, data);
-                    }).error($scope.emitHTTPError);
+                    }).error(function (data, status, headers, config) {
+                        if (status === 404) {
+                            console.log("refreshFolder:", data);
+                        } else {
+                            $scope.emitHTTPError(data, status, headers, config);
+                        }
+                    });
                 }, 1000);
             }
             debouncedFuncs[key]();
