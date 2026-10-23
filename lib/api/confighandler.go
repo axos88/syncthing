@@ -8,14 +8,18 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
+	"strings"
 
 	"github.com/julienschmidt/httprouter"
 
 	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/structutil"
 )
@@ -90,7 +94,7 @@ func (c *configMuxBuilder) registerFolders(path string) {
 	})
 
 	c.HandlerFunc(http.MethodPost, path, func(w http.ResponseWriter, r *http.Request) {
-		c.adjustFolder(w, r, c.cfg.DefaultFolder(), false)
+		c.addFolder(w, r)
 	})
 }
 
@@ -140,7 +144,7 @@ func (c *configMuxBuilder) registerFolder(path string) {
 	})
 
 	c.Handle(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-		c.adjustFolder(w, r, c.cfg.DefaultFolder(), false)
+		c.addFolder(w, r)
 	})
 
 	c.Handle(http.MethodPatch, path, func(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
@@ -337,11 +341,71 @@ func (c *configMuxBuilder) adjustConfig(w http.ResponseWriter, r *http.Request) 
 	c.finish(w, waiter)
 }
 
+// addFolder adds a folder, or replaces the one with the same ID, starting
+// from the folder defaults. A new folder's relative path is resolved against
+// the default folder path.
+func (c *configMuxBuilder) addFolder(w http.ResponseWriter, r *http.Request) {
+	defaults := c.cfg.DefaultFolder()
+	folder := defaults.Copy()
+	if err := unmarshalTo(r.Body, &folder); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, exists := c.cfg.Folder(folder.ID); !exists && isRelativeFolderPath(folder.Path) {
+		folder.Path = filepath.Join(defaults.Path, folder.Path)
+		if status, err := checkNewFolderPath(folder); err != nil {
+			http.Error(w, err.Error(), status)
+			return
+		}
+	}
+	c.setFolder(w, folder, false)
+}
+
+// isRelativeFolderPath reports whether path is neither absolute nor starts
+// with a tilde, which is expanded to the home directory. A relative folder
+// path is otherwise relative to the working directory of the process.
+func isRelativeFolderPath(path string) bool {
+	if path == "" || filepath.IsAbs(path) {
+		return false
+	}
+	path = filepath.FromSlash(path)
+	return path != "~" && !strings.HasPrefix(path, "~"+string(filepath.Separator))
+}
+
+// checkNewFolderPath refuses a path resolved for a new folder that holds
+// something already: as it was derived from a name rather than given in
+// full, it's unlikely to be the intended place for existing data.
+func checkNewFolderPath(folder config.FolderConfiguration) (int, error) {
+	ffs := fs.NewFilesystem(folder.FilesystemType.ToFS(), folder.Path)
+	info, err := ffs.Lstat(".")
+	if fs.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if !info.IsDir() {
+		return http.StatusConflict, fmt.Errorf("%s exists and is not a directory", folder.Path)
+	}
+	names, err := ffs.DirNames(".")
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if len(names) > 0 {
+		return http.StatusConflict, fmt.Errorf("%s exists and is not empty", folder.Path)
+	}
+	return 0, nil
+}
+
 func (c *configMuxBuilder) adjustFolder(w http.ResponseWriter, r *http.Request, folder config.FolderConfiguration, defaults bool) {
 	if err := unmarshalTo(r.Body, &folder); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	c.setFolder(w, folder, defaults)
+}
+
+func (c *configMuxBuilder) setFolder(w http.ResponseWriter, folder config.FolderConfiguration, defaults bool) {
 	waiter, err := c.cfg.Modify(func(cfg *config.Configuration) {
 		if defaults {
 			cfg.Defaults.Folder = folder

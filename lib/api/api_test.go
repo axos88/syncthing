@@ -1682,6 +1682,107 @@ func TestShouldRegenerateCertificate(t *testing.T) {
 	}
 }
 
+func TestConfigNewFolderRelativePath(t *testing.T) {
+	t.Parallel()
+
+	const testAPIKey = "foobarbaz"
+	defaultPath := t.TempDir()
+	cfg := config.Configuration{
+		// Current, so no migration rewrites the default folder path.
+		Version: config.CurrentVersion,
+		GUI: config.GUIConfiguration{
+			RawAddress: "127.0.0.1:0",
+			RawUseTLS:  false,
+			APIKey:     testAPIKey,
+		},
+		Defaults: config.Defaults{
+			Folder: config.FolderConfiguration{Path: defaultPath},
+		},
+	}
+	tmpFile, err := os.CreateTemp("", "syncthing-testConfig-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	w := config.Wrap(tmpFile.Name(), cfg, protocol.LocalDeviceID, events.NoopLogger)
+	tmpFile.Close()
+	cfgCtx, cfgCancel := context.WithCancel(context.Background())
+	go w.Serve(cfgCtx)
+	defer cfgCancel()
+	baseURL := startHTTP(t, w)
+
+	send := func(method, path string, folder map[string]string, status int) {
+		t.Helper()
+		bs, err := json.Marshal(folder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, _ := http.NewRequest(method, baseURL+path, bytes.NewReader(bs))
+		req.Header.Set("X-API-Key", testAPIKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != status {
+			t.Errorf("%s %v: expected status %v, got %v", method, folder, status, resp.StatusCode)
+		}
+	}
+	post := func(folder map[string]string, status int) {
+		t.Helper()
+		send(http.MethodPost, "/rest/config/folders", folder, status)
+	}
+	expectPath := func(id, want string) {
+		t.Helper()
+		folder, ok := w.Folder(id)
+		if !ok {
+			t.Fatalf("folder %s missing", id)
+		}
+		if folder.Path != want {
+			t.Errorf("folder %s: got path %q, want %q", id, folder.Path, want)
+		}
+	}
+
+	// A new folder's relative path is resolved against the default path,
+	// whether the directory is missing or empty.
+	post(map[string]string{"id": "aaaaa-11111", "path": "aaaaa-11111"}, http.StatusOK)
+	expectPath("aaaaa-11111", filepath.Join(defaultPath, "aaaaa-11111"))
+	if err := os.Mkdir(filepath.Join(defaultPath, "Empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	post(map[string]string{"id": "bbbbb-22222", "path": "Empty"}, http.StatusOK)
+	expectPath("bbbbb-22222", filepath.Join(defaultPath, "Empty"))
+	send(http.MethodPut, "/rest/config/folders/ccccc-33333", map[string]string{"id": "ccccc-33333", "path": "ccccc-33333"}, http.StatusOK)
+	expectPath("ccccc-33333", filepath.Join(defaultPath, "ccccc-33333"))
+
+	// Something there already is a conflict, and nothing is added.
+	if err := os.Mkdir(filepath.Join(defaultPath, "Full"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultPath, "Full", "file"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultPath, "AFile"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for id, path := range map[string]string{"ddddd-44444": "Full", "eeeee-55555": "AFile"} {
+		post(map[string]string{"id": id, "path": path}, http.StatusConflict)
+		if _, ok := w.Folder(id); ok {
+			t.Errorf("folder %s added despite the conflict", id)
+		}
+	}
+
+	// Absolute and home-relative paths are kept, and so is an existing
+	// folder's path.
+	absolute := filepath.Join(t.TempDir(), "elsewhere")
+	post(map[string]string{"id": "fffff-66666", "path": absolute}, http.StatusOK)
+	expectPath("fffff-66666", absolute)
+	post(map[string]string{"id": "ggggg-77777", "path": "~/ggggg-77777"}, http.StatusOK)
+	expectPath("ggggg-77777", "~/ggggg-77777")
+	post(map[string]string{"id": "aaaaa-11111", "path": "relative"}, http.StatusOK)
+	expectPath("aaaaa-11111", "relative")
+}
+
 func TestConfigChanges(t *testing.T) {
 	t.Parallel()
 
